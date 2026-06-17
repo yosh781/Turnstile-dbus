@@ -1,5 +1,5 @@
 /**
- * turnstile-dbus v2.4.0 - Extended version
+ * turnstile-dbus v2.5.0 - Extended version
  * Native org.turnstile.login1 interface
  * Power via D-Bus signals for dinit-dbus
  * Permission check via UID (no polkit dependency)
