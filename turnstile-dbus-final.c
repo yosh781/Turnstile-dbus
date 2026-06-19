@@ -1,5 +1,5 @@
 /**
- * turnstile-dbus v2.5.0 - Extended version
+ * turnstile-dbus v2.6.0 - Extended version
  * Native org.turnstile.login1 interface
  * Power via D-Bus signals for dinit-dbus
  * Permission check via UID (no polkit dependency)
@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <poll.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -28,6 +29,8 @@
 #define BUS_NAME "org.turnstile.login1"
 #define BUS_IFACE "org.turnstile.login1.Manager"
 #define BUS_OBJ "/org/turnstile/login1"
+#define LOGIND_IFACE "org.freedesktop.login1.Manager"
+static char *second_bus_name = NULL;
 #define VERSION "2.4.0"
 
 /* New structures for v2.4.0 */
@@ -148,6 +151,10 @@ static void read_config(void) {
             }
             else if (strcmp(key, "max_inhibit_delay") == 0)
                 max_inhibit_delay = atoi(value);
+            else if (strcmp(key, "second_bus_name") == 0) {
+                if (second_bus_name) free(second_bus_name);
+                second_bus_name = strdup(value);
+            }
             else if (strcmp(key, "enable_scheduled_shutdown") == 0)
                 enable_scheduled = (strcmp(value, "true") == 0);
         }
@@ -173,8 +180,8 @@ static void do_power_off(void) {
     }
     turnstile_stop_all_sessions();
     sync();
-    if (fallback_enabled) {
-        system("poweroff");
+    if (1) { /* Always use dinit-dbus */
+        system("dbus-send --system --dest=org.chimera.dinit --print-reply --type=method_call /org/chimera/dinit org.chimera.dinit.Manager.Shutdown string:poweroff");
     }
 }
 
@@ -187,8 +194,8 @@ static void do_reboot(void) {
     }
     turnstile_stop_all_sessions();
     sync();
-    if (fallback_enabled) {
-        system("reboot");
+    if (1) { /* Always use dinit-dbus */
+        system("dbus-send --system --dest=org.chimera.dinit --print-reply --type=method_call /org/chimera/dinit org.chimera.dinit.Manager.Shutdown string:reboot");
     }
 }
 
@@ -208,21 +215,14 @@ static void do_suspend(void) {
         }
     }
 }
-
 static void do_hibernate(void) {
     LOG_INFO_MSG("Hibernate: starting");
-    if (hibernate_method && strcmp(hibernate_method, "external") == 0) {
-        LOG_INFO_MSG("Hibernate: using external command");
-        system("pm-hibernate 2>/dev/null || echo disk > /sys/power/state");
-    } else {
-        LOG_INFO_MSG("Hibernate: writing disk to /sys/power/state");
+    int ret = system("pm-hibernate 2>/dev/null");
+    LOG_INFO_MSG("Hibernate: pm-hibernate returned %d", ret);
+    if (ret != 0) {
+        sync();
         int fd = open("/sys/power/state", O_WRONLY);
-        if (fd >= 0) {
-            write(fd, "disk", 4);
-            close(fd);
-        } else {
-            LOG_ERROR_MSG("Hibernate: failed to open /sys/power/state");
-        }
+        if (fd >= 0) { write(fd, "disk", 4); close(fd); }
     }
 }
 
@@ -416,7 +416,8 @@ static void turnstile_event_cb(turnstile *ts, int event, unsigned long id, void 
 static void *monitor_thread_func(void *arg) {
     (void)arg;
     while (running && ts_monitor) {
-        turnstile_dispatch(ts_monitor, 1000);
+        turnstile_dispatch(ts_monitor, 100);
+        usleep(50000);
     }
     return NULL;
 }
@@ -424,33 +425,40 @@ static void *monitor_thread_func(void *arg) {
 /* Permission check via D-Bus UID */
 static int check_permission(DBusMessage *msg) {
     const char *sender = dbus_message_get_sender(msg);
-    if (!sender) return 0;
-    
-    DBusMessage *req = dbus_message_new_method_call(
-        "org.freedesktop.DBus", "/org/freedesktop/DBus",
-        "org.freedesktop.DBus", "GetConnectionUnixUser");
-    if (!req) return 0;
-    
-    dbus_message_append_args(req, DBUS_TYPE_STRING, &sender, DBUS_TYPE_INVALID);
-    
+    if (!sender) {
+        LOG_INFO_MSG("check_permission: no sender");
+        return 0;
+    }
+
     DBusError err;
     dbus_error_init(&err);
-    DBusMessage *resp = dbus_connection_send_with_reply_and_block(conn, req, 1000, &err);
-    dbus_message_unref(req);
     
-    if (!resp) {
+    unsigned long uid = dbus_bus_get_unix_user(conn, sender, &err);
+    
+    if (dbus_error_is_set(&err)) {
+        LOG_ERROR_MSG("check_permission: failed to get UID for %s: %s", sender, err.message);
         dbus_error_free(&err);
         return 0;
     }
-    
-    dbus_uint32_t uid = 0;
-    dbus_message_get_args(resp, &err, DBUS_TYPE_UINT32, &uid, DBUS_TYPE_INVALID);
-    dbus_message_unref(resp);
-    
-    return (uid == 0 || uid > 0);
-}
 
-/* Runtime directory handlers */
+    /* Root always allowed */
+    if (uid == 0) {
+        LOG_INFO_MSG("check_permission: root allowed");
+        return 1;
+    }
+
+    /* Check if user has any session (like logind) */
+    turnstile_session *sessions = NULL;
+    size_t count = 0;
+    if (turnstile_get_user_sessions(uid, &sessions, &count) == 0 && count > 0) {
+        LOG_INFO_MSG("check_permission: uid=%lu allowed (has %zu session(s))", uid, count);
+        turnstile_free_sessions(sessions, count);
+        return 1;
+    }
+
+    LOG_INFO_MSG("check_permission: uid=%lu denied (no sessions)", uid);
+    return 0;
+}
 static void handle_get_runtime_dir(DBusMessage *msg) {
     dbus_uint32_t uid;
     if (!dbus_message_get_args(msg, NULL, DBUS_TYPE_UINT32, &uid, DBUS_TYPE_INVALID)) {
@@ -680,6 +688,168 @@ static void handle_list_users(DBusMessage *msg) {
     dbus_connection_send(conn, reply, NULL);
     dbus_message_unref(reply);
 }
+/* CreateSession for KDE compatibility */
+/* CreateSession for KDE compatibility */
+static void handle_create_session(DBusMessage *msg) {
+    dbus_uint32_t uid, pid = 0;
+    const char *service = "", *type = "unspecified", *class_type = "user";
+    const char *desktop = "", *seat_id = "seat0";
+    dbus_uint32_t vtnr = 0;
+    const char *tty = "", *display = "";
+    dbus_bool_t remote = FALSE;
+    const char *remote_user = "", *remote_host = "";
+    
+    if (!dbus_message_get_args(msg, NULL,
+        DBUS_TYPE_UINT32, &uid, DBUS_TYPE_UINT32, &pid,
+        DBUS_TYPE_STRING, &service, DBUS_TYPE_STRING, &type,
+        DBUS_TYPE_STRING, &class_type, DBUS_TYPE_STRING, &desktop,
+        DBUS_TYPE_STRING, &seat_id, DBUS_TYPE_UINT32, &vtnr,
+        DBUS_TYPE_STRING, &tty, DBUS_TYPE_STRING, &display,
+        DBUS_TYPE_BOOLEAN, &remote, DBUS_TYPE_STRING, &remote_user,
+        DBUS_TYPE_STRING, &remote_host, DBUS_TYPE_INVALID)) {
+        DBusMessage *err = dbus_message_new_error(msg, DBUS_ERROR_INVALID_ARGS, "Expected uid,pid,...");
+        dbus_connection_send(conn, err, NULL);
+        dbus_message_unref(err);
+        return;
+    }
+    
+    turnstile_session session;
+    unsigned long session_id = 0;
+    memset(&session, 0, sizeof(session));
+    if (turnstile_create_session(&session, &session_id) < 0 || session_id == 0) {
+        DBusMessage *err = dbus_message_new_error(msg, DBUS_ERROR_FAILED, "Failed to create session");
+        dbus_connection_send(conn, err, NULL);
+        dbus_message_unref(err);
+        return;
+    }
+    
+    char session_path[64], id_buf[32];
+    snprintf(session_path, sizeof(session_path), "/org/turnstile/login1/session/%lu", session_id);
+    snprintf(id_buf, sizeof(id_buf), "%lu", session_id);
+    const char *objpath = session_path, *session_id_str = id_buf;
+    
+    DBusMessage *reply = dbus_message_new_method_return(msg);
+    if (reply) {
+        dbus_message_append_args(reply,
+            DBUS_TYPE_STRING, &session_id_str,
+            DBUS_TYPE_OBJECT_PATH, &objpath,
+            DBUS_TYPE_STRING, &objpath,
+            DBUS_TYPE_UNIX_FD, &session_id,
+            DBUS_TYPE_STRING, &seat_id,
+            DBUS_TYPE_UINT32, &vtnr,
+            DBUS_TYPE_BOOLEAN, &remote,
+            DBUS_TYPE_STRING, &remote_user,
+            DBUS_TYPE_STRING, &remote_host,
+            DBUS_TYPE_INVALID);
+        dbus_connection_send(conn, reply, NULL);
+        dbus_message_unref(reply);
+    }
+    LOG_INFO_MSG("CreateSession: uid=%u session=%lu desktop=%s", uid, session_id, desktop);
+}
+/* ReleaseSession for KDE compatibility */
+static void handle_release_session(DBusMessage *msg) {
+    const char *session_id_str;
+    if (!dbus_message_get_args(msg, NULL, DBUS_TYPE_STRING, &session_id_str, DBUS_TYPE_INVALID)) {
+        DBusMessage *err = dbus_message_new_error(msg, DBUS_ERROR_INVALID_ARGS, "Expected session ID");
+        dbus_connection_send(conn, err, NULL);
+        dbus_message_unref(err);
+        return;
+    }
+    unsigned long session_id = strtoul(session_id_str, NULL, 10);
+    if (turnstile_release_session(session_id) < 0) {
+        DBusMessage *err = dbus_message_new_error(msg, DBUS_ERROR_FAILED, "Failed to release session");
+        dbus_connection_send(conn, err, NULL);
+        dbus_message_unref(err);
+        return;
+    }
+    DBusMessage *reply = dbus_message_new_method_return(msg);
+    if (reply) { dbus_connection_send(conn, reply, NULL); dbus_message_unref(reply); }
+    LOG_INFO_MSG("ReleaseSession: session=%lu", session_id);
+}
+
+/* ActivateSession for session switching */
+static void handle_activate_session(DBusMessage *msg) {
+    const char *session_id_str;
+    if (!dbus_message_get_args(msg, NULL, DBUS_TYPE_STRING, &session_id_str, DBUS_TYPE_INVALID)) {
+        DBusMessage *err = dbus_message_new_error(msg, DBUS_ERROR_INVALID_ARGS, "Expected session ID");
+        dbus_connection_send(conn, err, NULL);
+        dbus_message_unref(err);
+        return;
+    }
+    unsigned long session_id = strtoul(session_id_str, NULL, 10);
+    if (turnstile_activate_session(session_id) < 0) {
+        DBusMessage *err = dbus_message_new_error(msg, DBUS_ERROR_FAILED, "Failed to activate session");
+        dbus_connection_send(conn, err, NULL);
+        dbus_message_unref(err);
+        return;
+    }
+    DBusMessage *reply = dbus_message_new_method_return(msg);
+    if (reply) { dbus_connection_send(conn, reply, NULL); dbus_message_unref(reply); }
+    LOG_INFO_MSG("ActivateSession: session=%lu", session_id);
+}
+
+/* GetSessionByPID for KDE compatibility */
+static void handle_get_session_by_pid(DBusMessage *msg) {
+    dbus_uint32_t pid;
+    if (!dbus_message_get_args(msg, NULL, DBUS_TYPE_UINT32, &pid, DBUS_TYPE_INVALID)) {
+        DBusMessage *err = dbus_message_new_error(msg, DBUS_ERROR_INVALID_ARGS, "Expected PID");
+        dbus_connection_send(conn, err, NULL);
+        dbus_message_unref(err);
+        return;
+    }
+    turnstile_session session;
+    memset(&session, 0, sizeof(session));
+    if (turnstile_get_session_by_pid(pid, &session) < 0 || session.id == 0) {
+        DBusMessage *err = dbus_message_new_error(msg, DBUS_ERROR_FAILED, "Session not found for PID");
+        dbus_connection_send(conn, err, NULL);
+        dbus_message_unref(err);
+        return;
+    }
+    char path[64];
+    snprintf(path, sizeof(path), "/org/turnstile/login1/session/%lu", session.id);
+    const char *objpath = path;
+    DBusMessage *reply = dbus_message_new_method_return(msg);
+    if (reply) {
+        dbus_message_append_args(reply, DBUS_TYPE_OBJECT_PATH, &objpath, DBUS_TYPE_INVALID);
+        dbus_connection_send(conn, reply, NULL);
+        dbus_message_unref(reply);
+    }
+    LOG_INFO_MSG("GetSessionByPID: pid=%u session=%lu", pid, session.id);
+}
+
+/* SetIdleHint for KDE screen locker */
+static void handle_set_session_idle(DBusMessage *msg) {
+    const char *session_id_str;
+    dbus_bool_t idle;
+    if (!dbus_message_get_args(msg, NULL, DBUS_TYPE_STRING, &session_id_str, DBUS_TYPE_BOOLEAN, &idle, DBUS_TYPE_INVALID)) {
+        DBusMessage *err = dbus_message_new_error(msg, DBUS_ERROR_INVALID_ARGS, "Expected session ID and idle");
+        dbus_connection_send(conn, err, NULL);
+        dbus_message_unref(err);
+        return;
+    }
+    unsigned long session_id = strtoul(session_id_str, NULL, 10);
+    turnstile_set_session_idle(session_id, idle);
+    DBusMessage *reply = dbus_message_new_method_return(msg);
+    if (reply) { dbus_connection_send(conn, reply, NULL); dbus_message_unref(reply); }
+    LOG_INFO_MSG("SetIdleHint: session=%lu idle=%d", session_id, idle);
+}
+
+/* SetSessionState for KDE */
+static void handle_set_session_state(DBusMessage *msg) {
+    const char *session_id_str, *state;
+    if (!dbus_message_get_args(msg, NULL, DBUS_TYPE_STRING, &session_id_str, DBUS_TYPE_STRING, &state, DBUS_TYPE_INVALID)) {
+        DBusMessage *err = dbus_message_new_error(msg, DBUS_ERROR_INVALID_ARGS, "Expected session ID and state");
+        dbus_connection_send(conn, err, NULL);
+        dbus_message_unref(err);
+        return;
+    }
+    unsigned long session_id = strtoul(session_id_str, NULL, 10);
+    turnstile_set_session_state(session_id, state);
+    DBusMessage *reply = dbus_message_new_method_return(msg);
+    if (reply) { dbus_connection_send(conn, reply, NULL); dbus_message_unref(reply); }
+    LOG_INFO_MSG("SetSessionState: session=%lu state=%s", session_id, state);
+}
+
 
 static void handle_get_session(DBusMessage *msg) {
     const char *session_id_str;
@@ -762,8 +932,6 @@ static void handle_get_user_sessions(DBusMessage *msg) {
     }
     
     dbus_message_iter_close_container(&iter, &array_iter);
-    turnstile_free_sessions(sessions, count);
-    dbus_connection_send(conn, reply, NULL);
     dbus_message_unref(reply);
 }
 
@@ -945,6 +1113,16 @@ static void handle_can_reboot(DBusMessage *msg) {
     }
 }
 
+static void handle_can_graphical(DBusMessage *msg) {
+    const char *result = "yes";
+    DBusMessage *reply = dbus_message_new_method_return(msg);
+    if (reply) {
+        dbus_message_append_args(reply, DBUS_TYPE_STRING, &result, DBUS_TYPE_INVALID);
+        dbus_connection_send(conn, reply, NULL);
+        dbus_message_unref(reply);
+    }
+}
+
 static void handle_can_suspend(DBusMessage *msg) {
     const char *result = check_suspend_support() ? "yes" : "no";
     DBusMessage *reply = dbus_message_new_method_return(msg);
@@ -989,7 +1167,7 @@ static void handle_properties_get(DBusMessage *msg) {
     DBusMessageIter iter, variant;
     dbus_message_iter_init_append(reply, &iter);
     dbus_message_iter_open_container(&iter, DBUS_TYPE_VARIANT, "s", &variant);
-    if (strcmp(iface, BUS_IFACE) == 0) {
+    if (strcmp(iface, BUS_IFACE) == 0 || strcmp(iface, LOGIND_IFACE) == 0) {
         if (strcmp(prop, "ActiveSeat") == 0) {
             char *seat = NULL;
             turnstile_get_active_seat(&seat);
@@ -1001,6 +1179,18 @@ static void handle_properties_get(DBusMessage *msg) {
             turnstile_get_active_vtnr(&vtnr);
             dbus_uint32_t v = vtnr;
             dbus_message_iter_append_basic(&variant, DBUS_TYPE_UINT32, &v);
+        } else if (strcmp(prop, "CanPowerOff") == 0) {
+            const char *val = "yes";
+            dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
+        } else if (strcmp(prop, "CanReboot") == 0) {
+            const char *val = "yes";
+            dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
+        } else if (strcmp(prop, "CanSuspend") == 0) {
+            const char *val = check_suspend_support() ? "yes" : "no";
+            dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
+        } else if (strcmp(prop, "CanHibernate") == 0) {
+            const char *val = check_hibernate_support() ? "yes" : "no";
+            dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
         } else {
             const char *empty = "";
             dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &empty);
@@ -1125,6 +1315,16 @@ static void handle_introspect(DBusMessage *msg) {
         "    <method name='SetWallMessage'><arg type='s' direction='in'/></method>"
         "    <method name='ScheduleShutdown'><arg type='s' direction='in'/><arg type='x' direction='in'/></method>"
         "    <method name='CancelScheduledShutdown'/>"
+        "    <method name='CreateSession'><arg type='u' direction='in'/><arg type='u' direction='in'/><arg type='s' direction='in'/><arg type='s' direction='in'/><arg type='s' direction='in'/><arg type='s' direction='in'/><arg type='s' direction='in'/><arg type='u' direction='in'/><arg type='s' direction='in'/><arg type='s' direction='in'/><arg type='b' direction='in'/><arg type='s' direction='in'/><arg type='s' direction='in'/><arg type='s' direction='out'/><arg type='o' direction='out'/><arg type='s' direction='out'/><arg type='h' direction='out'/><arg type='s' direction='out'/><arg type='u' direction='out'/><arg type='b' direction='out'/><arg type='s' direction='out'/><arg type='s' direction='out'/></method>"
+        "    <method name='ReleaseSession'><arg type='s' direction='in'/></method>"
+        "    <method name='ActivateSession'><arg type='s' direction='in'/></method>"
+        "    <method name='GetSessionByPID'><arg type='u' direction='in'/><arg type='o' direction='out'/></method>"
+        "    <method name='SetIdleHint'><arg type='s' direction='in'/><arg type='b' direction='in'/></method>"
+        "    <method name='SetSessionState'><arg type='s' direction='in'/><arg type='s' direction='in'/></method>"
+        "    <method name='LockSession'><arg type='s' direction='in'/></method>"
+        "    <method name='UnlockSession'><arg type='s' direction='in'/></method>"
+        "    <method name='CanGraphical'><arg type='s' direction='out'/></method>"
+
         "    <method name='Inhibit'><arg type='s' direction='in'/><arg type='s' direction='in'/><arg type='s' direction='in'/><arg type='s' direction='in'/><arg type='h' direction='out'/></method>"
         "    <method name='ReloadConfig'/>"
         "    <signal name='SessionNew'><arg type='s'/><arg type='o'/></signal>"
@@ -1139,6 +1339,9 @@ static void handle_introspect(DBusMessage *msg) {
         "  </interface>"
         "  <interface name='org.freedesktop.DBus.Introspectable'>"
         "    <method name='Introspect'><arg type='s' direction='out'/></method>"
+        "  </interface>"
+        "  <interface name='org.freedesktop.login1.Manager'>"
+        "    <!-- All methods available via turnstile.login1.Manager -->"
         "  </interface>"
         "</node>";
     
@@ -1160,9 +1363,27 @@ static DBusHandlerResult message_handler(DBusConnection *connection,
     const char *interface = dbus_message_get_interface(msg);
     const char *member = dbus_message_get_member(msg);
     
+    LOG_INFO_MSG("D-Bus call: %s.%s from %s", interface?:"?", member?:"?", dbus_message_get_sender(msg)?:"?");
+    LOG_INFO_MSG("D-Bus: %s.%s sender=%s", interface?:"?", member?:"?", dbus_message_get_sender(msg)?:"?");
     if (!interface || !member)
         return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
     
+    
+    /* Handle Seat interface for KDE */
+    if (strstr(dbus_message_get_path(msg), "/org/freedesktop/login1/seat/") ||
+        strstr(dbus_message_get_path(msg), "/org/turnstile/login1/seat/")) {
+        if (strcmp(member, "SwitchTo") == 0) { handle_switch_to_vt(msg); return DBUS_HANDLER_RESULT_HANDLED; }
+        if (strcmp(member, "ActivateSession") == 0) { handle_activate_session(msg); return DBUS_HANDLER_RESULT_HANDLED; }
+    }
+    
+    /* Handle Session interface for KDE */
+    if (strstr(dbus_message_get_path(msg), "/org/freedesktop/login1/session/") ||
+        strstr(dbus_message_get_path(msg), "/org/turnstile/login1/session/")) {
+        if (strcmp(member, "Lock") == 0 || strcmp(member, "Unlock") == 0) { handle_set_session_state(msg); return DBUS_HANDLER_RESULT_HANDLED; }
+        if (strcmp(member, "SetIdleHint") == 0) { handle_set_session_idle(msg); return DBUS_HANDLER_RESULT_HANDLED; }
+        if (strcmp(member, "Activate") == 0) { handle_activate_session(msg); return DBUS_HANDLER_RESULT_HANDLED; }
+    }
+
     if (strcmp(interface, "org.freedesktop.DBus.Properties") == 0) {
         if (strcmp(member, "Get") == 0) handle_properties_get(msg);
         else if (strcmp(member, "GetAll") == 0) handle_properties_get_all(msg);
@@ -1176,7 +1397,7 @@ static DBusHandlerResult message_handler(DBusConnection *connection,
         return DBUS_HANDLER_RESULT_HANDLED;
     }
     
-    if (strcmp(interface, BUS_IFACE) != 0)
+    if (strcmp(interface, BUS_IFACE) != 0 && strcmp(interface, LOGIND_IFACE) != 0)
         return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
     
     /* Permission check for destructive methods */
@@ -1197,6 +1418,16 @@ static DBusHandlerResult message_handler(DBusConnection *connection,
         }
     }
     
+    if (strcmp(member, "CreateSession") == 0) handle_create_session(msg);
+    else if (strcmp(member, "ReleaseSession") == 0) handle_release_session(msg);
+    else if (strcmp(member, "ActivateSession") == 0) handle_activate_session(msg);
+    else if (strcmp(member, "GetSessionByPID") == 0) handle_get_session_by_pid(msg);
+    else if (strcmp(member, "SetIdleHint") == 0) handle_set_session_idle(msg);
+    else if (strcmp(member, "SetSessionState") == 0) handle_set_session_state(msg);
+    else if (strcmp(member, "LockSession") == 0) handle_set_session_state(msg);
+    else if (strcmp(member, "UnlockSession") == 0) handle_set_session_state(msg);
+    else if (strcmp(member, "CanGraphical") == 0) handle_can_graphical(msg);
+    else 
     if (strcmp(member, "ListSessions") == 0) handle_list_sessions(msg);
     else if (strcmp(member, "ListUsers") == 0) handle_list_users(msg);
     else if (strcmp(member, "GetSession") == 0) handle_get_session(msg);
@@ -1220,9 +1451,7 @@ static DBusHandlerResult message_handler(DBusConnection *connection,
     else if (strcmp(member, "CanHybridSleep") == 0) handle_can_hybrid_sleep(msg);
     else if (strcmp(member, "SetWallMessage") == 0) handle_set_wall_message(msg);
     else if (strcmp(member, "ScheduleShutdown") == 0) handle_schedule_shutdown(msg);
-    else if (strcmp(member, "CancelScheduledShutdown") == 0 ||
-        strcmp(member, "SwitchToVT") == 0 ||
-        strcmp(member, "ReloadConfig") == 0) handle_cancel_scheduled_shutdown(msg);
+    else if (strcmp(member, "CancelScheduledShutdown") == 0) handle_cancel_scheduled_shutdown(msg);
     else if (strcmp(member, "SwitchToVT") == 0) handle_switch_to_vt(msg);
     else if (strcmp(member, "ReloadConfig") == 0) handle_reload_config(msg);
     else if (strcmp(member, "Inhibit") == 0) handle_inhibit(msg);
@@ -1270,10 +1499,11 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     
-    int ret = dbus_bus_request_name(conn, BUS_NAME, DBUS_NAME_FLAG_REPLACE_EXISTING, &dbus_err);
+    int ret = dbus_bus_request_name(conn, BUS_NAME, DBUS_NAME_FLAG_REPLACE_EXISTING | DBUS_NAME_FLAG_DO_NOT_QUEUE, &dbus_err);
     if (ret != DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER) {
         LOG_ERROR_MSG("Failed to acquire name %s: %s", BUS_NAME, dbus_err.message);
         dbus_error_free(&dbus_err);
+    if (conn) { dbus_bus_release_name(conn, BUS_NAME, NULL); if (second_bus_name) dbus_bus_release_name(conn, second_bus_name, NULL); dbus_connection_flush(conn); }
         dbus_connection_unref(conn);
         return 1;
     }
@@ -1281,8 +1511,31 @@ int main(int argc, char *argv[]) {
     DBusObjectPathVTable vtable = {0};
     vtable.message_function = message_handler;
     dbus_connection_register_object_path(conn, BUS_OBJ, &vtable, NULL);
+    /* Also register on logind-compatible object path */
+    /* Register Seat objects for KDE */
+    dbus_connection_register_object_path(conn, "/org/freedesktop/login1/seat/seat0", &vtable, NULL);
+    dbus_connection_register_object_path(conn, "/org/freedesktop/login1/seat/auto", &vtable, NULL);
+
+    dbus_connection_register_object_path(conn, "/org/freedesktop/login1", &vtable, NULL);
     
     LOG_INFO_MSG("Service registered as %s", BUS_NAME);
+
+    /* Register optional second bus name for logind compatibility */
+    if (second_bus_name && second_bus_name[0] != '\0') {
+        dbus_error_free(&dbus_err);
+        dbus_error_init(&dbus_err);
+        int ret2 = dbus_bus_request_name(conn, second_bus_name,
+                                         DBUS_NAME_FLAG_REPLACE_EXISTING | DBUS_NAME_FLAG_DO_NOT_QUEUE,
+                                         &dbus_err);
+        if (ret2 == DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER) {
+            LOG_INFO_MSG("Also registered as %s", second_bus_name);
+        } else {
+            LOG_ERROR_MSG("Failed to acquire %s: %s", second_bus_name,
+                          dbus_err.message ? dbus_err.message : "unknown");
+            dbus_error_free(&dbus_err);
+            dbus_error_init(&dbus_err);
+        }
+    }
     
     ts_monitor = turnstile_new();
     if (ts_monitor) {
@@ -1295,7 +1548,7 @@ int main(int argc, char *argv[]) {
     LOG_INFO_MSG("Ready to handle requests (v%s)", VERSION);
     
     while (running) {
-        dbus_connection_read_write_dispatch(conn, 1000);
+        dbus_connection_read_write_dispatch(conn, 50);
         
         /* Check scheduled shutdown */
         if (sched_shutdown && sched_shutdown->active && enable_scheduled) {
@@ -1319,6 +1572,7 @@ int main(int argc, char *argv[]) {
     LOG_INFO_MSG("Shutting down...");
     
     if (ts_monitor) turnstile_free(ts_monitor);
+    if (conn) { dbus_bus_release_name(conn, BUS_NAME, NULL); if (second_bus_name) dbus_bus_release_name(conn, second_bus_name, NULL); dbus_connection_flush(conn); }
     dbus_connection_unref(conn);
     
     /* Cleanup */
@@ -1326,6 +1580,7 @@ int main(int argc, char *argv[]) {
         if (sched_shutdown->wall_message) free(sched_shutdown->wall_message);
         free(sched_shutdown);
     }
+    if (second_bus_name) { free(second_bus_name); second_bus_name = NULL; }
     if (shutdown_wall_message) free(shutdown_wall_message);
     if (suspend_method) free(suspend_method);
     if (hibernate_method) free(hibernate_method);
@@ -1339,3 +1594,4 @@ int main(int argc, char *argv[]) {
     if (enable_syslog) closelog();
     return 0;
 }
+
