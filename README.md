@@ -4,6 +4,8 @@
 
 turnstile-dbus implements the `org.turnstile.login1` D-Bus interface for session and power management, using **Turnstile + Seatd + Dinit** as the init/seat stack. It provides a logind-compatible API for desktop environments, display managers, and applications.
 
+Provides `org.freedesktop.login1` compatibility for KDE, LXQt, and other desktop environments that expect logind over D-Bus.
+
 ---
 
 ## Features
@@ -99,15 +101,24 @@ text
 - **Native /sys/power/state** — no external power management tools required
 
 ---
+📋 Compatibility
+
+DE	            Status
+KDE Plasma	    ✅ Full support
+LXQt	        ✅ Full support
+XFCE	        ✅ Should work
+GNOME	        ⚠️ Requires systemd, incompatible
+Sway/Hyprland	⚠️ Needs testing
 
 ## Dependencies
 
 - `libdbus-1-3` (>= 1.12.0)
 - `libturnstile-highlevel` — Turnstile high-level C library
 - `libturnstile0` — Turnstile low-level library
+- `libturnstile-dev`
 - `dinit` — init system
 - `seatd` — seat management daemon
-
+- `gcc`  
 **Conflicts:** `systemd`, `elogind`
 
 ---
@@ -118,12 +129,19 @@ text
 # Install build dependencies
 sudo apt install libdbus-1-dev libturnstile-dev
 
-# Build
-bash build-v2.5.sh
+Build from source
+
+bash
+git clone https://github.com/yosh781/Turnstile-dbus.git
+cd turnstile-dbus
+./build-v2.6.sh
+sudo cp turnstile-dbus /usr/sbin/
+sudo dinitctl start turnstile-dbus
+
 
 # Run
 sudo ./turnstile-dbus
-Build script (build-v2.5.sh)
+Build script (build-v2.6.sh)
 bash
 gcc -o turnstile-dbus src/turnstile-dbus-final.c \
     -I/usr/include/dbus-1.0 \
@@ -249,7 +267,27 @@ sudo dinitctl restart turnstile-dbus
 
 # Test
 /usr/share/turnstile/test-api-v2.4.sh
+
+
 Changelog
+
+turnstile-dbus (2.6.0) stable; urgency=medium
+
+  * Fixed deadlock in check_permission - replaced blocking
+    dbus_connection_send_with_reply_and_block with non-blocking
+    dbus_bus_get_unix_user
+  * Fixed bug: SwitchToVT, ReloadConfig, CancelScheduledShutdown
+    were incorrectly merged into one handler
+  * Added automatic D-Bus name release before request to fix
+    stale name registrations after crash
+  * Added DBUS_NAME_FLAG_DO_NOT_QUEUE for aggressive name takeover
+  * Added KDE compatibility:
+    - CreateSession, ReleaseSession, ActivateSession
+    - GetSessionByPID, SetIdleHint, SetSessionState
+    - LockSession, UnlockSession, CanGraphical
+    - Seat/Session object paths for properties
+  * Registered /org/freedesktop/login1/seat/seat0 and auto
+
 v2.5.0
 D-Bus Properties interface (Get, GetAll, Set)
 
@@ -297,3 +335,4 @@ Turnstile: https://github.com/turnstile/turnstile
 Dinit: https://github.com/davmac314/dinit
 
 Seatd: https://git.sr.ht/~kennylevinsen/seatd
+
