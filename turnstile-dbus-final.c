@@ -1065,6 +1065,7 @@ static void handle_suspend(DBusMessage *msg) {
     }
     emit_prepare_for_sleep(1);
     dbus_connection_flush(conn);
+    usleep(500000); /* 500ms delay for reply delivery */
     do_suspend();
 }
 
@@ -1082,6 +1083,7 @@ static void handle_hibernate(DBusMessage *msg) {
         LOG_INFO_MSG("Hibernate: %d inhibitors active, waiting %ds", inhibitors_count, max_inhibit_delay);
         emit_prepare_for_sleep(1);
         dbus_connection_flush(conn);
+    usleep(500000); /* 500ms delay for reply delivery */
         sleep(max_inhibit_delay);
         if (inhibitors_count > 0) {
             LOG_INFO_MSG("Hibernate cancelled: inhibitors still active");
@@ -1091,6 +1093,8 @@ static void handle_hibernate(DBusMessage *msg) {
     }
     emit_prepare_for_sleep(1);
     dbus_connection_flush(conn);
+    usleep(500000); /* 500ms delay for reply delivery */
+    usleep(500000); /* 500ms delay for reply delivery */
     do_hibernate();
 }
 static void handle_can_power_off(DBusMessage *msg) {
