@@ -285,8 +285,10 @@ turnstile-dbus (2.6.0) stable; urgency=medium
     - CreateSession, ReleaseSession, ActivateSession
     - GetSessionByPID, SetIdleHint, SetSessionState
     - LockSession, UnlockSession, CanGraphical
+    - CanSuspendThenHibernate, RebootTo*
     - Seat/Session object paths for properties
   * Registered /org/freedesktop/login1/seat/seat0 and auto
+  * Inhibitor disabled for all power operations
 
 v2.5.0
 D-Bus Properties interface (Get, GetAll, Set)
