@@ -5,6 +5,7 @@
  * Permission check via UID (no polkit dependency)
  * Extended config support
  * New: SetWallMessage, ScheduleShutdown, CancelScheduledShutdown, Inhibit
+ *autor @valera https://github.com/yosh781 for MSD Linux based on antiX
  */
 
 #include <stdio.h>
@@ -178,7 +179,7 @@ static void do_power_off(void) {
         snprintf(cmd, sizeof(cmd), "wall \"%s\"", shutdown_wall_message);
         system(cmd);
     }
-    turnstile_stop_all_sessions();
+    // turnstile_stop_all_sessions(); /* dinit handles this */
     sync();
     if (1) { /* Always use dinit-dbus */
         system("dbus-send --system --dest=org.chimera.dinit --print-reply --type=method_call /org/chimera/dinit org.chimera.dinit.Manager.Shutdown string:poweroff");
@@ -192,7 +193,7 @@ static void do_reboot(void) {
         snprintf(cmd, sizeof(cmd), "wall \"%s\"", shutdown_wall_message);
         system(cmd);
     }
-    turnstile_stop_all_sessions();
+    // turnstile_stop_all_sessions(); /* dinit handles this */
     sync();
     if (1) { /* Always use dinit-dbus */
         system("dbus-send --system --dest=org.chimera.dinit --print-reply --type=method_call /org/chimera/dinit org.chimera.dinit.Manager.Shutdown string:reboot");
@@ -1000,17 +1001,6 @@ static void handle_power_off(DBusMessage *msg) {
         dbus_message_unref(reply);
     }
     dbus_connection_flush(conn);
-    if (inhibitors_count > 0) {
-        LOG_INFO_MSG("PowerOff: %d inhibitors active, waiting %ds", inhibitors_count, max_inhibit_delay);
-        emit_prepare_for_shutdown(1);
-        dbus_connection_flush(conn);
-        sleep(max_inhibit_delay);
-        if (inhibitors_count > 0) {
-            LOG_INFO_MSG("PowerOff cancelled: inhibitors still active");
-            emit_prepare_for_shutdown(0);
-            return;
-        }
-    }
     emit_prepare_for_shutdown(1);
     dbus_connection_flush(conn);
     do_power_off();
@@ -1026,17 +1016,6 @@ static void handle_reboot(DBusMessage *msg) {
         dbus_message_unref(reply);
     }
     dbus_connection_flush(conn);
-    if (inhibitors_count > 0) {
-        LOG_INFO_MSG("Reboot: %d inhibitors active, waiting %ds", inhibitors_count, max_inhibit_delay);
-        emit_prepare_for_shutdown(1);
-        dbus_connection_flush(conn);
-        sleep(max_inhibit_delay);
-        if (inhibitors_count > 0) {
-            LOG_INFO_MSG("Reboot cancelled: inhibitors still active");
-            emit_prepare_for_shutdown(0);
-            return;
-        }
-    }
     emit_prepare_for_shutdown(1);
     dbus_connection_flush(conn);
     do_reboot();
@@ -1052,20 +1031,9 @@ static void handle_suspend(DBusMessage *msg) {
         dbus_message_unref(reply);
     }
     dbus_connection_flush(conn);
-    if (inhibitors_count > 0) {
-        LOG_INFO_MSG("Suspend: %d inhibitors active, waiting %ds", inhibitors_count, max_inhibit_delay);
-        emit_prepare_for_sleep(1);
-        dbus_connection_flush(conn);
-        sleep(max_inhibit_delay);
-        if (inhibitors_count > 0) {
-            LOG_INFO_MSG("Suspend cancelled: inhibitors still active");
-            emit_prepare_for_sleep(0);
-            return;
-        }
-    }
     emit_prepare_for_sleep(1);
     dbus_connection_flush(conn);
-    usleep(500000); /* 500ms delay for reply delivery */
+    usleep(500000);
     do_suspend();
 }
 
@@ -1079,24 +1047,12 @@ static void handle_hibernate(DBusMessage *msg) {
         dbus_message_unref(reply);
     }
     dbus_connection_flush(conn);
-    if (inhibitors_count > 0) {
-        LOG_INFO_MSG("Hibernate: %d inhibitors active, waiting %ds", inhibitors_count, max_inhibit_delay);
-        emit_prepare_for_sleep(1);
-        dbus_connection_flush(conn);
-    usleep(500000); /* 500ms delay for reply delivery */
-        sleep(max_inhibit_delay);
-        if (inhibitors_count > 0) {
-            LOG_INFO_MSG("Hibernate cancelled: inhibitors still active");
-            emit_prepare_for_sleep(0);
-            return;
-        }
-    }
     emit_prepare_for_sleep(1);
     dbus_connection_flush(conn);
-    usleep(500000); /* 500ms delay for reply delivery */
-    usleep(500000); /* 500ms delay for reply delivery */
+    usleep(500000);
     do_hibernate();
 }
+
 static void handle_can_power_off(DBusMessage *msg) {
     const char *result = "yes";
     DBusMessage *reply = dbus_message_new_method_return(msg);
@@ -1157,6 +1113,16 @@ static void handle_can_hybrid_sleep(DBusMessage *msg) {
     }
 }
 
+static void handle_can_suspend_then_hibernate(DBusMessage *msg) {
+    const char *result = (check_suspend_support() && check_hibernate_support()) ? "yes" : "no";
+    DBusMessage *reply = dbus_message_new_method_return(msg);
+    if (reply) {
+        dbus_message_append_args(reply, DBUS_TYPE_STRING, &result, DBUS_TYPE_INVALID);
+        dbus_connection_send(conn, reply, NULL);
+        dbus_message_unref(reply);
+    }
+}
+
 /* Properties interface */
 static void handle_properties_get(DBusMessage *msg) {
     const char *iface, *prop;
@@ -1194,6 +1160,15 @@ static void handle_properties_get(DBusMessage *msg) {
             dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
         } else if (strcmp(prop, "CanHibernate") == 0) {
             const char *val = check_hibernate_support() ? "yes" : "no";
+            dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
+        } else if (strcmp(prop, "RebootToFirmwareSetup") == 0) {
+            const char *val = "no";
+            dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
+        } else if (strcmp(prop, "RebootToBootLoaderMenu") == 0) {
+            const char *val = "no";
+            dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
+        } else if (strcmp(prop, "RebootToBootLoaderEntry") == 0) {
+            const char *val = "no";
             dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
         } else {
             const char *empty = "";
@@ -1316,6 +1291,7 @@ static void handle_introspect(DBusMessage *msg) {
         "    <method name='CanSuspend'><arg type='s' direction='out'/></method>"
         "    <method name='CanHibernate'><arg type='s' direction='out'/></method>"
         "    <method name='CanHybridSleep'><arg type='s' direction='out'/></method>"
+        "    <method name='CanSuspendThenHibernate'><arg type='s' direction='out'/></method>"
         "    <method name='SetWallMessage'><arg type='s' direction='in'/></method>"
         "    <method name='ScheduleShutdown'><arg type='s' direction='in'/><arg type='x' direction='in'/></method>"
         "    <method name='CancelScheduledShutdown'/>"
@@ -1453,6 +1429,7 @@ static DBusHandlerResult message_handler(DBusConnection *connection,
     else if (strcmp(member, "CanSuspend") == 0) handle_can_suspend(msg);
     else if (strcmp(member, "CanHibernate") == 0) handle_can_hibernate(msg);
     else if (strcmp(member, "CanHybridSleep") == 0) handle_can_hybrid_sleep(msg);
+    else if (strcmp(member, "CanSuspendThenHibernate") == 0) handle_can_suspend_then_hibernate(msg);
     else if (strcmp(member, "SetWallMessage") == 0) handle_set_wall_message(msg);
     else if (strcmp(member, "ScheduleShutdown") == 0) handle_schedule_shutdown(msg);
     else if (strcmp(member, "CancelScheduledShutdown") == 0) handle_cancel_scheduled_shutdown(msg);
@@ -1598,4 +1575,5 @@ int main(int argc, char *argv[]) {
     if (enable_syslog) closelog();
     return 0;
 }
+
 
