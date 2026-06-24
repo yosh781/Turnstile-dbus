@@ -271,6 +271,16 @@ sudo dinitctl restart turnstile-dbus
 
 Changelog
 
+### v2.6.2 (2024-06-24) — Bugfix Release
+
+* **Fixed race condition**: `pthread_detach` → `pthread_join` prevents use-after-free crash on daemon shutdown
+* **Fixed `GetUserSessions` no-reply bug**: Added missing `dbus_connection_send()` — method now returns proper response
+* **Fixed memory leak**: `turnstile_free_sessions()` now called in `GetUserSessions`
+* **Fixed memory leak**: `wall_message` properly freed before overwriting in `ScheduleShutdown`
+* **Fixed D-Bus type error**: `DBUS_TYPE_UNIX_FD` → `DBUS_TYPE_UINT32` in `CreateSession` response (was sending `unsigned long` as file descriptor)
+* **Removed duplicate logging**: Double `LOG_INFO_MSG` on every D-Bus call reduced to single line
+* **Improved stability**: Proper thread cleanup prevents zombie threads on service restart
+
 turnstile-dbus (2.6.0) stable; urgency=medium
 
   * Fixed deadlock in check_permission - replaced blocking
