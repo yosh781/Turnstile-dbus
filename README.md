@@ -271,7 +271,7 @@ sudo dinitctl restart turnstile-dbus
 
 Changelog
 
-### v2.6.2 (2024-06-24) — Bugfix Release
+ v2.6.2  — Bugfix Release
 
 * **Fixed race condition**: `pthread_detach` → `pthread_join` prevents use-after-free crash on daemon shutdown
 * **Fixed `GetUserSessions` no-reply bug**: Added missing `dbus_connection_send()` — method now returns proper response
