@@ -271,6 +271,35 @@ sudo dinitctl restart turnstile-dbus
 
 Changelog
 
+v2.6.3
+
+### Added
+- **Integration with seatd via libseat** to pass DRM of devices to Wayland composers
+- New module 'seatd-helper.c/h' with support for libseat API v0.8+
+- Automatically fetch DRM fd via seatd when calling 'CreateSession'
+- Fallback to open devices directly if seatd is not available
+- **'CreateSession' now returns Unix FD** to the device '/dev/dri/card0'
+- Full compatibility with logind API for Wayland sessions
+- KWin,  Mutter, wlroots-composers get devices via D-Bus
+- **Registering session objects via 'dbus_connection_register_fallback'***
+- 'GetAll' and 'Get' for Properties now work on '/org/freedesktop/login1/session/*'
+- 'Introspect' correctly displays interfaces for session paths
+
+### Fixed
+- 'handle_create_session': replaced 'turnstile_get_user_sessions' with 'turnstile_get_sessions'
+to correctly search for existing sessions
+- 'ActiveSession' now returns '/org/freedesktop/login1/session/1' instead of 'auto'
+- 'handle_properties_get_all': added support for 'Session' and 'Seat' interfaces
+- Fixed passing 'DBUS_TYPE_UNIX_FD' in the 'CreateSession' response
+
+### Dependencies
+- Added: 'libseat-dev' (≥ 0.8) to integrate with seatd
+- Retained: 'libturnstile-dev', 'libturnstile-highlevel', 'libdbus-1-dev'
+
+### Assembly
+- Updated 'build-v2.6.sh' with pkg-config support for libseat
+- Added compilation 'seatd-helper.c' in the build process
+
  v2.6.2  — Bugfix Release
 
 * **Fixed race condition**: `pthread_detach` → `pthread_join` prevents use-after-free crash on daemon shutdown
