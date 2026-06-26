@@ -1,5 +1,5 @@
 /**
- * turnstile-dbus v2.6.2 - Extended version
+ * turnstile-dbus v2.6.3 - Extended version
  * Native org.turnstile.login1 interface
  * Power via D-Bus signals for dinit-dbus
  * Permission check via UID (no polkit dependency)
@@ -29,6 +29,7 @@
 
 #define BUS_NAME "org.turnstile.login1"
 #define LOGIND_BUS_NAME "org.freedesktop.login1"
+#include "seatd-helper.h"
 #define BUS_IFACE "org.turnstile.login1.Manager"
 #define BUS_OBJ "/org/turnstile/login1"
 #define LOGIND_IFACE "org.freedesktop.login1.Manager"
@@ -718,15 +719,36 @@ static void handle_create_session(DBusMessage *msg) {
         return;
     }
     
-    turnstile_session session;
+    /* Get existing sessions */
     unsigned long session_id = 0;
-    memset(&session, 0, sizeof(session));
-    if (turnstile_create_session(&session, &session_id) < 0 || session_id == 0) {
-        DBusMessage *err = dbus_message_new_error(msg, DBUS_ERROR_FAILED, "Failed to create session");
-        dbus_connection_send(conn, err, NULL);
-        dbus_message_unref(err);
-        return;
+    turnstile_session *sessions = NULL;
+    size_t count = 0;
+    
+    if (turnstile_get_sessions(&sessions, &count) == 0 && count > 0) {
+        for (size_t i = 0; i < count; i++) {
+            if (sessions[i].uid == uid) {
+                session_id = sessions[i].id;
+                break;
+            }
+        }
+        turnstile_free_sessions(sessions, count);
     }
+    
+    if (session_id == 0) {
+        turnstile_session session;
+        memset(&session, 0, sizeof(session));
+        session.uid = uid;
+        
+        if (turnstile_create_session(&session, &session_id) < 0 || session_id == 0) {
+            DBusMessage *err = dbus_message_new_error(msg, DBUS_ERROR_FAILED, "Failed to create session");
+            dbus_connection_send(conn, err, NULL);
+            dbus_message_unref(err);
+            return;
+        }
+    }
+    
+    /* Get DRM fd from seatd */
+    int drm_fd = seatd_helper_get_drm_fd(session_id);
     
     char session_path[64], id_buf[32];
     snprintf(session_path, sizeof(session_path), "/org/turnstile/login1/session/%lu", session_id);
@@ -739,7 +761,7 @@ static void handle_create_session(DBusMessage *msg) {
             DBUS_TYPE_STRING, &session_id_str,
             DBUS_TYPE_OBJECT_PATH, &objpath,
             DBUS_TYPE_STRING, &objpath,
-            DBUS_TYPE_UINT32, &pid,
+            DBUS_TYPE_UNIX_FD, &drm_fd,
             DBUS_TYPE_STRING, &seat_id,
             DBUS_TYPE_UINT32, &vtnr,
             DBUS_TYPE_BOOLEAN, &remote,
@@ -749,9 +771,9 @@ static void handle_create_session(DBusMessage *msg) {
         dbus_connection_send(conn, reply, NULL);
         dbus_message_unref(reply);
     }
-    LOG_INFO_MSG("CreateSession: uid=%u session=%lu desktop=%s", uid, session_id, desktop);
+    LOG_INFO_MSG("CreateSession: uid=%u session=%lu drm_fd=%d", uid, session_id, drm_fd);
 }
-/* ReleaseSession for KDE compatibility */
+
 static void handle_release_session(DBusMessage *msg) {
     const char *session_id_str;
     if (!dbus_message_get_args(msg, NULL, DBUS_TYPE_STRING, &session_id_str, DBUS_TYPE_INVALID)) {
@@ -1199,7 +1221,7 @@ static void handle_properties_get(DBusMessage *msg) {
     } else if (strcmp(iface, "org.freedesktop.login1.Seat") == 0 ||
                strcmp(iface, "org.turnstile.login1.Seat") == 0) {
         if (strcmp(prop, "ActiveSession") == 0) {
-            const char *val = "/org/freedesktop/login1/session/auto";
+            const char *val = "/org/freedesktop/login1/session/1";
             dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
         } else if (strcmp(prop, "CanGraphical") == 0) {
             const char *val = "yes";
@@ -1245,7 +1267,9 @@ static void handle_properties_get_all(DBusMessage *msg) {
     DBusMessageIter iter, array_iter;
     dbus_message_iter_init_append(reply, &iter);
     dbus_message_iter_open_container(&iter, DBUS_TYPE_ARRAY, "{sv}", &array_iter);
-    if (strcmp(iface, BUS_IFACE) == 0) {
+    
+    if (strcmp(iface, BUS_IFACE) == 0 || strcmp(iface, LOGIND_IFACE) == 0) {
+        /* Manager properties */
         DBusMessageIter entry, variant;
         const char *prop = "ActiveSeat";
         dbus_message_iter_open_container(&array_iter, DBUS_TYPE_DICT_ENTRY, NULL, &entry);
@@ -1269,11 +1293,64 @@ static void handle_properties_get_all(DBusMessage *msg) {
         dbus_message_iter_append_basic(&variant, DBUS_TYPE_UINT32, &v);
         dbus_message_iter_close_container(&entry, &variant);
         dbus_message_iter_close_container(&array_iter, &entry);
+    } else if (strcmp(iface, "org.freedesktop.login1.Seat") == 0 ||
+               strcmp(iface, "org.turnstile.login1.Seat") == 0) {
+        /* Seat properties */
+        DBusMessageIter entry, variant;
+        const char *prop = "ActiveSession";
+        dbus_message_iter_open_container(&array_iter, DBUS_TYPE_DICT_ENTRY, NULL, &entry);
+        dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &prop);
+        dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "s", &variant);
+        const char *val = "/org/freedesktop/login1/session/1";
+        dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
+        dbus_message_iter_close_container(&entry, &variant);
+        dbus_message_iter_close_container(&array_iter, &entry);
+        
+        prop = "CanGraphical";
+        dbus_message_iter_open_container(&array_iter, DBUS_TYPE_DICT_ENTRY, NULL, &entry);
+        dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &prop);
+        dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "s", &variant);
+        val = "yes";
+        dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
+        dbus_message_iter_close_container(&entry, &variant);
+        dbus_message_iter_close_container(&array_iter, &entry);
+        
+        prop = "Id";
+        dbus_message_iter_open_container(&array_iter, DBUS_TYPE_DICT_ENTRY, NULL, &entry);
+        dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &prop);
+        dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "s", &variant);
+        val = "seat0";
+        dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
+        dbus_message_iter_close_container(&entry, &variant);
+        dbus_message_iter_close_container(&array_iter, &entry);
+    } else if (strcmp(iface, "org.freedesktop.login1.Session") == 0 ||
+               strcmp(iface, "org.turnstile.login1.Session") == 0) {
+        /* Session properties */
+        DBusMessageIter entry, variant;
+        const char *prop = "Active";
+        dbus_message_iter_open_container(&array_iter, DBUS_TYPE_DICT_ENTRY, NULL, &entry);
+        dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &prop);
+        dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "b", &variant);
+        dbus_bool_t bval = TRUE;
+        dbus_message_iter_append_basic(&variant, DBUS_TYPE_BOOLEAN, &bval);
+        dbus_message_iter_close_container(&entry, &variant);
+        dbus_message_iter_close_container(&array_iter, &entry);
+        
+        prop = "State";
+        dbus_message_iter_open_container(&array_iter, DBUS_TYPE_DICT_ENTRY, NULL, &entry);
+        dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &prop);
+        dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "s", &variant);
+        const char *val = "active";
+        dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
+        dbus_message_iter_close_container(&entry, &variant);
+        dbus_message_iter_close_container(&array_iter, &entry);
     }
+    
     dbus_message_iter_close_container(&iter, &array_iter);
     dbus_connection_send(conn, reply, NULL);
     dbus_message_unref(reply);
 }
+
 
 static void handle_properties_set(DBusMessage *msg) {
     DBusMessage *reply = dbus_message_new_method_return(msg);
@@ -1548,6 +1625,8 @@ int main(int argc, char *argv[]) {
     dbus_connection_register_object_path(conn, "/org/freedesktop/login1/seat/auto", &vtable, NULL);
 
     dbus_connection_register_object_path(conn, "/org/freedesktop/login1", &vtable, NULL);
+    dbus_connection_register_fallback(conn, "/org/freedesktop/login1/session", &vtable, NULL);
+    dbus_connection_register_fallback(conn, "/org/turnstile/login1/session", &vtable, NULL);
     
     LOG_INFO_MSG("Service registered as %s", BUS_NAME);
 
@@ -1628,5 +1707,3 @@ int main(int argc, char *argv[]) {
     if (enable_syslog) closelog();
     return 0;
 }
-
-
