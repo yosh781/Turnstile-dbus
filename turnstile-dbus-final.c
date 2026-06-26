@@ -12,6 +12,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <sys/reboot.h>
+#include <sys/wait.h>
 #include <poll.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -20,21 +22,24 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <errno.h>
+#include <sys/reboot.h>
+#include <sys/wait.h>
 #include <dbus/dbus.h>
 #include <turnstile-highlevel.h>
 #include <turnstile.h>
 #include <pwd.h>
 #include <grp.h>
 #include <syslog.h>
+#include "seatd-helper.h"
 
 #define BUS_NAME "org.turnstile.login1"
 #define LOGIND_BUS_NAME "org.freedesktop.login1"
-#include "seatd-helper.h"
 #define BUS_IFACE "org.turnstile.login1.Manager"
 #define BUS_OBJ "/org/turnstile/login1"
 #define LOGIND_IFACE "org.freedesktop.login1.Manager"
+#define VERSION "2.6.3"
+
 static char *second_bus_name = NULL;
-#define VERSION "2.4.0"
 
 /* New structures for v2.4.0 */
 typedef struct {
@@ -52,6 +57,8 @@ typedef struct {
 
 static DBusConnection *conn = NULL;
 static volatile sig_atomic_t running = 1;
+static pthread_mutex_t monitor_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t monitor_cond = PTHREAD_COND_INITIALIZER;
 static turnstile *ts_monitor = NULL;
 static pthread_t monitor_thread;
 static int enable_syslog = 1;
@@ -86,7 +93,11 @@ static void signal_handler(int sig) {
         return;
     }
     LOG_INFO_MSG("Signal %d received, shutting down", sig);
+
+    pthread_mutex_lock(&monitor_mutex);
     running = 0;
+    pthread_cond_signal(&monitor_cond);
+    pthread_mutex_unlock(&monitor_mutex);
 }
 
 static void read_config(void) {
@@ -177,28 +188,50 @@ static void emit_prepare_for_sleep(int start);
 static void do_power_off(void) {
     LOG_INFO_MSG("Power off: stopping sessions");
     if (shutdown_wall_message) {
-        char cmd[512];
-        snprintf(cmd, sizeof(cmd), "wall \"%s\"", shutdown_wall_message);
-        system(cmd);
+        pid_t pid = fork();
+        if (pid == 0) {
+            execl("/usr/bin/wall", "wall", shutdown_wall_message, NULL);
+            _exit(1);
+        }
     }
-    // turnstile_stop_all_sessions(); /* dinit handles this */
     sync();
-    if (1) { /* Always use dinit-dbus */
-        system("dbus-send --system --dest=org.chimera.dinit --print-reply --type=method_call /org/chimera/dinit org.chimera.dinit.Manager.Shutdown string:poweroff");
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        execl("/usr/bin/dbus-send", "dbus-send", "--system",
+              "--dest=org.chimera.dinit", "--print-reply",
+              "--type=method_call", "/org/chimera/dinit",
+              "org.chimera.dinit.Manager.Shutdown",
+              "string:poweroff", NULL);
+        /* Fallback to direct shutdown if dbus-send fails */
+        sync();
+        reboot(RB_POWER_OFF);
+        _exit(1);
     }
 }
 
 static void do_reboot(void) {
     LOG_INFO_MSG("Reboot: stopping sessions");
     if (shutdown_wall_message) {
-        char cmd[512];
-        snprintf(cmd, sizeof(cmd), "wall \"%s\"", shutdown_wall_message);
-        system(cmd);
+        pid_t pid = fork();
+        if (pid == 0) {
+            execl("/usr/bin/wall", "wall", shutdown_wall_message, NULL);
+            _exit(1);
+        }
     }
-    // turnstile_stop_all_sessions(); /* dinit handles this */
     sync();
-    if (1) { /* Always use dinit-dbus */
-        system("dbus-send --system --dest=org.chimera.dinit --print-reply --type=method_call /org/chimera/dinit org.chimera.dinit.Manager.Shutdown string:reboot");
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        execl("/usr/bin/dbus-send", "dbus-send", "--system",
+              "--dest=org.chimera.dinit", "--print-reply",
+              "--type=method_call", "/org/chimera/dinit",
+              "org.chimera.dinit.Manager.Shutdown",
+              "string:reboot", NULL);
+        /* Fallback to direct reboot if dbus-send fails */
+        sync();
+        reboot(RB_AUTOBOOT);
+        _exit(1);
     }
 }
 
@@ -206,7 +239,17 @@ static void do_suspend(void) {
     LOG_INFO_MSG("Suspend: starting");
     if (suspend_method && strcmp(suspend_method, "external") == 0) {
         LOG_INFO_MSG("Suspend: using external command");
-        system("pm-suspend 2>/dev/null || echo mem > /sys/power/state");
+        pid_t pid = fork();
+        if (pid == 0) {
+            execl("/usr/sbin/pm-suspend", "pm-suspend", NULL);
+            /* Fallback */
+            int fd = open("/sys/power/state", O_WRONLY);
+            if (fd >= 0) {
+                write(fd, "mem", 3);
+                close(fd);
+            }
+            _exit(1);
+        }
     } else {
         LOG_INFO_MSG("Suspend: writing mem to /sys/power/state");
         int fd = open("/sys/power/state", O_WRONLY);
@@ -218,14 +261,20 @@ static void do_suspend(void) {
         }
     }
 }
+
 static void do_hibernate(void) {
     LOG_INFO_MSG("Hibernate: starting");
-    int ret = system("pm-hibernate 2>/dev/null");
-    LOG_INFO_MSG("Hibernate: pm-hibernate returned %d", ret);
-    if (ret != 0) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        execl("/usr/sbin/pm-hibernate", "pm-hibernate", NULL);
+        /* Fallback */
         sync();
         int fd = open("/sys/power/state", O_WRONLY);
-        if (fd >= 0) { write(fd, "disk", 4); close(fd); }
+        if (fd >= 0) {
+            write(fd, "disk", 4);
+            close(fd);
+        }
+        _exit(1);
     }
 }
 
@@ -282,6 +331,44 @@ static void emit_prepare_for_sleep(int start) {
         dbus_connection_send(conn, signal, NULL);
         dbus_message_unref(signal);
     }
+}
+
+/* Permission check via D-Bus UID */
+static int check_permission(DBusMessage *msg) {
+    const char *sender = dbus_message_get_sender(msg);
+    if (!sender) {
+        LOG_INFO_MSG("check_permission: no sender");
+        return 0;
+    }
+
+    DBusError err;
+    dbus_error_init(&err);
+
+    unsigned long uid = dbus_bus_get_unix_user(conn, sender, &err);
+
+    if (dbus_error_is_set(&err)) {
+        LOG_ERROR_MSG("check_permission: failed to get UID for %s: %s", sender, err.message);
+        dbus_error_free(&err);
+        return 0;
+    }
+
+    /* Root always allowed */
+    if (uid == 0) {
+        LOG_INFO_MSG("check_permission: root allowed");
+        return 1;
+    }
+
+    /* Check if user has any session (like logind) */
+    turnstile_session *sessions = NULL;
+    size_t count = 0;
+    if (turnstile_get_user_sessions(uid, &sessions, &count) == 0 && count > 0) {
+        LOG_INFO_MSG("check_permission: uid=%lu allowed (has %zu session(s))", uid, count);
+        turnstile_free_sessions(sessions, count);
+        return 1;
+    }
+
+    LOG_INFO_MSG("check_permission: uid=%lu denied (no sessions)", uid);
+    return 0;
 }
 
 /* New functions for v2.4.0 */
@@ -364,42 +451,56 @@ static void handle_inhibit(DBusMessage *msg) {
         DBUS_TYPE_STRING, &mode,
         DBUS_TYPE_INVALID)) {
         DBusMessage *err = dbus_message_new_error(msg, DBUS_ERROR_INVALID_ARGS, "Expected what,who,why,mode");
-        dbus_connection_send(conn, err, NULL);
-        dbus_message_unref(err);
-        return;
-    }
-    
-    void *tmp = realloc(inhibitors, (inhibitors_count + 1) * sizeof(InhibitorLock));
-    if (!tmp) {
-        DBusMessage *err = dbus_message_new_error(msg, DBUS_ERROR_NO_MEMORY, "Failed to allocate inhibitor");
-        dbus_connection_send(conn, err, NULL);
-        dbus_message_unref(err);
-        return;
-    }
-    inhibitors = tmp;
-    if (inhibitors) {
+    dbus_connection_send(conn, err, NULL);
+    dbus_message_unref(err);
+    return;
+        }
+
+        /* Permission check */
+        if (!check_permission(msg)) {
+            DBusMessage *err = dbus_message_new_error(msg, DBUS_ERROR_ACCESS_DENIED, "Permission denied");
+            dbus_connection_send(conn, err, NULL);
+            dbus_message_unref(err);
+            return;
+        }
+
+        /* Create pipe for monitoring fd close */
+        int pipe_fds[2];
+        if (pipe(pipe_fds) < 0) {
+            DBusMessage *err = dbus_message_new_error(msg, DBUS_ERROR_FAILED, "Failed to create pipe");
+            dbus_connection_send(conn, err, NULL);
+            dbus_message_unref(err);
+            return;
+        }
+
+        void *tmp = realloc(inhibitors, (inhibitors_count + 1) * sizeof(InhibitorLock));
+        if (!tmp) {
+            close(pipe_fds[0]);
+            close(pipe_fds[1]);
+            DBusMessage *err = dbus_message_new_error(msg, DBUS_ERROR_NO_MEMORY, "Failed to allocate inhibitor");
+            dbus_connection_send(conn, err, NULL);
+            dbus_message_unref(err);
+            return;
+        }
+        inhibitors = tmp;
+
         inhibitors[inhibitors_count].name = strdup(who);
         inhibitors[inhibitors_count].description = strdup(why);
-        inhibitors[inhibitors_count].fd = inhibitors_count + 1;
-        
-        int fd_val = inhibitors[inhibitors_count].fd;
+        inhibitors[inhibitors_count].fd = pipe_fds[0];  /* Read end for monitoring */
         inhibitors_count++;
-        
-        LOG_INFO_MSG("Inhibit: who=%s why=%s what=%s", who, why, what);
-        
+
+        LOG_INFO_MSG("Inhibit: who=%s why=%s what=%s mode=%s", who, why, what, mode);
+
         DBusMessage *reply = dbus_message_new_method_return(msg);
         if (reply) {
             dbus_message_append_args(reply,
-                DBUS_TYPE_UNIX_FD, &fd_val,
-                DBUS_TYPE_INVALID);
+                                     DBUS_TYPE_UNIX_FD, &pipe_fds[1],  /* Give write end to client */
+                                     DBUS_TYPE_INVALID);
             dbus_connection_send(conn, reply, NULL);
             dbus_message_unref(reply);
         }
-    } else {
-        DBusMessage *err = dbus_message_new_error(msg, DBUS_ERROR_NO_MEMORY, "Failed to allocate inhibitor");
-        dbus_connection_send(conn, err, NULL);
-        dbus_message_unref(err);
-    }
+
+        close(pipe_fds[1]);  /* Close our copy of write end */
 }
 
 /* Turnstile event callback */
@@ -421,50 +522,25 @@ static void turnstile_event_cb(turnstile *ts, int event, unsigned long id, void 
 
 static void *monitor_thread_func(void *arg) {
     (void)arg;
-    while (running && ts_monitor) {
-        turnstile_dispatch(ts_monitor, 100);
+
+    while (1) {
+        pthread_mutex_lock(&monitor_mutex);
+        if (!running || !ts_monitor) {
+            pthread_mutex_unlock(&monitor_mutex);
+            break;
+        }
+        pthread_mutex_unlock(&monitor_mutex);
+
+        if (ts_monitor) {
+            turnstile_dispatch(ts_monitor, 100);
+        }
         usleep(50000);
     }
+
+    LOG_INFO_MSG("Monitor thread exiting");
     return NULL;
 }
 
-/* Permission check via D-Bus UID */
-static int check_permission(DBusMessage *msg) {
-    const char *sender = dbus_message_get_sender(msg);
-    if (!sender) {
-        LOG_INFO_MSG("check_permission: no sender");
-        return 0;
-    }
-
-    DBusError err;
-    dbus_error_init(&err);
-    
-    unsigned long uid = dbus_bus_get_unix_user(conn, sender, &err);
-    
-    if (dbus_error_is_set(&err)) {
-        LOG_ERROR_MSG("check_permission: failed to get UID for %s: %s", sender, err.message);
-        dbus_error_free(&err);
-        return 0;
-    }
-
-    /* Root always allowed */
-    if (uid == 0) {
-        LOG_INFO_MSG("check_permission: root allowed");
-        return 1;
-    }
-
-    /* Check if user has any session (like logind) */
-    turnstile_session *sessions = NULL;
-    size_t count = 0;
-    if (turnstile_get_user_sessions(uid, &sessions, &count) == 0 && count > 0) {
-        LOG_INFO_MSG("check_permission: uid=%lu allowed (has %zu session(s))", uid, count);
-        turnstile_free_sessions(sessions, count);
-        return 1;
-    }
-
-    LOG_INFO_MSG("check_permission: uid=%lu denied (no sessions)", uid);
-    return 0;
-}
 static void handle_get_runtime_dir(DBusMessage *msg) {
     dbus_uint32_t uid;
     if (!dbus_message_get_args(msg, NULL, DBUS_TYPE_UINT32, &uid, DBUS_TYPE_INVALID)) {
@@ -1042,32 +1118,44 @@ static void handle_suspend(DBusMessage *msg) {
     dbus_bool_t interactive = FALSE;
     dbus_message_get_args(msg, NULL, DBUS_TYPE_BOOLEAN, &interactive, DBUS_TYPE_INVALID);
     (void)interactive;
+
     DBusMessage *reply = dbus_message_new_method_return(msg);
     if (reply) {
         dbus_connection_send(conn, reply, NULL);
         dbus_message_unref(reply);
     }
+
     dbus_connection_flush(conn);
     emit_prepare_for_sleep(1);
     dbus_connection_flush(conn);
     usleep(500000);
     do_suspend();
+
+    /* Send wake-up signal */
+    emit_prepare_for_sleep(0);
+    dbus_connection_flush(conn);
 }
 
 static void handle_hibernate(DBusMessage *msg) {
     dbus_bool_t interactive = FALSE;
     dbus_message_get_args(msg, NULL, DBUS_TYPE_BOOLEAN, &interactive, DBUS_TYPE_INVALID);
     (void)interactive;
+
     DBusMessage *reply = dbus_message_new_method_return(msg);
     if (reply) {
         dbus_connection_send(conn, reply, NULL);
         dbus_message_unref(reply);
     }
+
     dbus_connection_flush(conn);
     emit_prepare_for_sleep(1);
     dbus_connection_flush(conn);
     usleep(500000);
     do_hibernate();
+
+    /* Send wake-up signal */
+    emit_prepare_for_sleep(0);
+    dbus_connection_flush(conn);
 }
 
 static void handle_can_power_off(DBusMessage *msg) {
@@ -1577,45 +1665,52 @@ static DBusHandlerResult message_handler(DBusConnection *connection,
 int main(int argc, char *argv[]) {
     (void)argc;
     (void)argv;
-    
+
     read_config();
     if (enable_syslog) {
         openlog("turnstile-dbus", LOG_PID | LOG_CONS, LOG_DAEMON);
     }
-    
-    
+
+
     LOG_INFO_MSG("Starting turnstile-dbus v%s", VERSION);
-    LOG_INFO_MSG("Config: power_management=%d, fallback=%d, scheduled=%d", 
+    LOG_INFO_MSG("Config: power_management=%d, fallback=%d, scheduled=%d",
                  power_management, fallback_enabled, enable_scheduled);
-    
+
     if (geteuid() != 0) {
         LOG_ERROR_MSG("Must be run as root!");
         return 1;
     }
-    
+
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
     signal(SIGHUP, signal_handler);
-    
+
     DBusError dbus_err;
     dbus_error_init(&dbus_err);
-    
+
     conn = dbus_bus_get(DBUS_BUS_SYSTEM, &dbus_err);
     if (!conn) {
         LOG_ERROR_MSG("Failed to connect to D-Bus: %s", dbus_err.message);
         dbus_error_free(&dbus_err);
         return 1;
     }
-    
+
     int ret = dbus_bus_request_name(conn, BUS_NAME, DBUS_NAME_FLAG_REPLACE_EXISTING | DBUS_NAME_FLAG_DO_NOT_QUEUE, &dbus_err);
     if (ret != DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER) {
-        LOG_ERROR_MSG("Failed to acquire name %s: %s", BUS_NAME, dbus_err.message);
-        dbus_error_free(&dbus_err);
-    if (conn) { dbus_bus_release_name(conn, BUS_NAME, NULL); if (second_bus_name) dbus_bus_release_name(conn, second_bus_name, NULL); dbus_connection_flush(conn); }
+        LOG_ERROR_MSG("Failed to acquire name %s: %s", BUS_NAME,
+                      dbus_error_is_set(&dbus_err) ? dbus_err.message : "unknown error");
+        if (dbus_error_is_set(&dbus_err)) dbus_error_free(&dbus_err);
         dbus_connection_unref(conn);
+        conn = NULL;
         return 1;
     }
-    
+
+    /* Clear any leftover error state */
+    if (dbus_error_is_set(&dbus_err)) {
+        dbus_error_free(&dbus_err);
+    }
+    dbus_error_init(&dbus_err);
+
     DBusObjectPathVTable vtable = {0};
     vtable.message_function = message_handler;
     dbus_connection_register_object_path(conn, BUS_OBJ, &vtable, NULL);
@@ -1627,26 +1722,29 @@ int main(int argc, char *argv[]) {
     dbus_connection_register_object_path(conn, "/org/freedesktop/login1", &vtable, NULL);
     dbus_connection_register_fallback(conn, "/org/freedesktop/login1/session", &vtable, NULL);
     dbus_connection_register_fallback(conn, "/org/turnstile/login1/session", &vtable, NULL);
-    
+
     LOG_INFO_MSG("Service registered as %s", BUS_NAME);
 
     /* Register optional second bus name for logind compatibility */
     if (second_bus_name && second_bus_name[0] != '\0') {
-        dbus_error_free(&dbus_err);
-        dbus_error_init(&dbus_err);
+        DBusError dbus_err2;
+        dbus_error_init(&dbus_err2);
+
         int ret2 = dbus_bus_request_name(conn, second_bus_name,
                                          DBUS_NAME_FLAG_REPLACE_EXISTING | DBUS_NAME_FLAG_DO_NOT_QUEUE,
-                                         &dbus_err);
+                                         &dbus_err2);
         if (ret2 == DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER) {
             LOG_INFO_MSG("Also registered as %s", second_bus_name);
         } else {
             LOG_ERROR_MSG("Failed to acquire %s: %s", second_bus_name,
-                          dbus_err.message ? dbus_err.message : "unknown");
-            dbus_error_free(&dbus_err);
-            dbus_error_init(&dbus_err);
+                          dbus_error_is_set(&dbus_err2) ? dbus_err2.message : "unknown");
+        }
+
+        if (dbus_error_is_set(&dbus_err2)) {
+            dbus_error_free(&dbus_err2);
         }
     }
-    
+
     ts_monitor = turnstile_new();
     if (ts_monitor) {
         turnstile_watch_events(ts_monitor, turnstile_event_cb, NULL);
@@ -1654,12 +1752,12 @@ int main(int argc, char *argv[]) {
         /* Will be joined in cleanup */
         LOG_INFO_MSG("Event monitoring active");
     }
-    
+
     LOG_INFO_MSG("Ready to handle requests (v%s)", VERSION);
-    
+
     while (running) {
         dbus_connection_read_write_dispatch(conn, 50);
-        
+
         /* Check scheduled shutdown */
         if (sched_shutdown && sched_shutdown->active && enable_scheduled) {
             time_t now = time(NULL);
@@ -1678,32 +1776,62 @@ int main(int argc, char *argv[]) {
             }
         }
     }
-    
+
     LOG_INFO_MSG("Shutting down...");
-    
+
+    running = 0;  /* Ensure flag is set for thread */
+
     if (ts_monitor) {
         pthread_join(monitor_thread, NULL);
         turnstile_free(ts_monitor);
+        ts_monitor = NULL;
     }
-    if (conn) { dbus_bus_release_name(conn, BUS_NAME, NULL); if (second_bus_name) dbus_bus_release_name(conn, second_bus_name, NULL); dbus_connection_flush(conn); }
-    dbus_connection_unref(conn);
-    
+
+    if (conn) {
+        dbus_bus_release_name(conn, BUS_NAME, NULL);
+        if (second_bus_name) {
+            dbus_bus_release_name(conn, second_bus_name, NULL);
+        }
+        dbus_connection_flush(conn);
+        dbus_connection_unref(conn);
+        conn = NULL;
+    }
+
     /* Cleanup */
     if (sched_shutdown) {
         if (sched_shutdown->wall_message) free(sched_shutdown->wall_message);
         free(sched_shutdown);
+        sched_shutdown = NULL;
     }
-    if (second_bus_name) { free(second_bus_name); second_bus_name = NULL; }
-    if (shutdown_wall_message) free(shutdown_wall_message);
-    if (suspend_method) free(suspend_method);
-    if (hibernate_method) free(hibernate_method);
-    if (default_seat) free(default_seat);
+    if (second_bus_name) {
+        free(second_bus_name);
+        second_bus_name = NULL;
+    }
+    if (shutdown_wall_message) {
+        free(shutdown_wall_message);
+        shutdown_wall_message = NULL;
+    }
+    if (suspend_method) {
+        free(suspend_method);
+        suspend_method = NULL;
+    }
+    if (hibernate_method) {
+        free(hibernate_method);
+        hibernate_method = NULL;
+    }
+    if (default_seat) {
+        free(default_seat);
+        default_seat = NULL;
+    }
     for (int i = 0; i < inhibitors_count; i++) {
         if (inhibitors[i].name) free(inhibitors[i].name);
         if (inhibitors[i].description) free(inhibitors[i].description);
     }
-    if (inhibitors) free(inhibitors);
-    
+    if (inhibitors) {
+        free(inhibitors);
+        inhibitors = NULL;
+    }
+
     if (enable_syslog) closelog();
     return 0;
 }
